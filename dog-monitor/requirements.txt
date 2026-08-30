@@ -1,4 +1,9 @@
-playwright==1.56.0
+# Pinned to match the Chromium build baked into the Dockerfile's base image
+# (mcr.microsoft.com/playwright/python:v1.55.0-noble). Bump both together.
+playwright==1.55.0
+google-cloud-firestore
+google-cloud-secret-manager
+
+# Local development / testing only (not required at runtime in Cloud Run).
 python-dotenv>=1.0,<2.0
-google-cloud-firestore>=2.16,<3.0
 pytest>=7.4,<9.0

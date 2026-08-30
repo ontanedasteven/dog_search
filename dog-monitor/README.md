@@ -25,23 +25,25 @@ stateless between executions).
 
 ```
 dog-monitor/
-  dog_monitor/
-    config.py           # env-var configuration
-    database.py          # Firestore-backed dedup/alert-state store
-    matching.py           # breed classification + ID/weight extraction (pure, unit-tested)
-    models.py              # Animal / MatchLevel / MatchResult dataclasses
-    alerts.py                # Gmail SMTP email composition + sending
-    logging_config.py          # stdlib logging setup
-    main.py                       # orchestration entry point
-    scrapers/
-      base.py                       # BaseScraper + generic pet-card engine
-      humane_broward.py               # Humane Society of Broward County
-      humane_miami.py                   # Humane Society of Greater Miami
-      petconnect.py                       # 24Petconnect (BRWD + MIAD agencies)
-  tests/                                     # pytest suite (matching, Firestore dedup, petconnect URL parsing)
-  Dockerfile
-  requirements.txt
-  .env.example
+├── dog_monitor/
+│   ├── config.py            # env-var configuration
+│   ├── database.py          # Firestore-backed dedup/alert-state store
+│   ├── matching.py          # breed classification + ID/weight extraction (pure, unit-tested)
+│   ├── models.py            # Animal / MatchLevel / MatchResult dataclasses
+│   ├── alerts.py            # Gmail SMTP email composition + sending
+│   ├── logging_config.py    # stdlib logging setup
+│   ├── main.py               # orchestration entry point
+│   └── scrapers/
+│       ├── base.py                # BaseScraper + generic pet-card engine
+│       ├── humane_broward.py      # Humane Society of Broward County
+│       ├── humane_miami.py        # Humane Society of Greater Miami
+│       └── petconnect.py          # 24Petconnect (BRWD + MIAD agencies)
+├── tests/                    # pytest suite (matching, Firestore dedup, petconnect URL parsing)
+├── Dockerfile
+├── requirements.txt
+├── cloudbuild.yaml           # Cloud Build pipeline: build -> push -> update the Cloud Run Job
+├── .env.example
+└── README.md
 ```
 
 ## IMPORTANT: selectors were not verified against live sites
@@ -173,12 +175,38 @@ real Firestore. In Cloud Run itself, credentials come from the job's
 attached service account automatically -- no mounting needed.)
 
 The `Dockerfile`'s base image tag must match the `playwright` version pinned
-in `requirements.txt` (currently `1.56.0`) so the bundled Chromium build
-lines up. This repo's build environment had no network access to
-`mcr.microsoft.com` to confirm the exact tag string -- verify it resolves
-(`docker pull mcr.microsoft.com/playwright/python:v1.56.0-noble`) before
-your first build, and adjust to whatever tag Microsoft currently publishes
-for that Playwright version if it doesn't.
+in `requirements.txt` (currently `1.55.0`) so the bundled Chromium build
+lines up -- if you bump one, bump the other. This repo's build environment
+had no network access to `mcr.microsoft.com` to confirm the exact tag
+string -- verify it resolves (`docker pull
+mcr.microsoft.com/playwright/python:v1.55.0-noble`) before your first
+build, and adjust to whatever tag Microsoft currently publishes for that
+Playwright version if it doesn't.
+
+`requirements.txt` also includes `google-cloud-secret-manager`. It is not
+currently imported by any application code -- the deploy steps below use
+Cloud Run's `--set-secrets` flag, which resolves Secret Manager secrets to
+plain environment variables before the container starts, so `config.py`
+just reads `os.getenv(...)` as usual. The dependency is there if you'd
+rather have the app fetch secrets directly via the Secret Manager API at
+runtime instead; that would need a small addition to `config.py` to call
+it, which isn't wired up here.
+
+### Building with Cloud Build directly
+
+`cloudbuild.yaml` builds the image, pushes it to Artifact Registry, and
+updates the (already-created) Cloud Run Job to use it -- useful once you've
+done the one-time `gcloud run jobs create` below and want repeatable
+redeploys (manually or via a Cloud Build trigger on push):
+
+```bash
+gcloud builds submit --config cloudbuild.yaml \
+  --substitutions=_REGION=REGION,_REPO=dog-monitor-repo,_IMAGE_NAME=dog-monitor,_JOB_NAME=dog-monitor-job
+```
+
+The build service account needs `roles/run.developer` in addition to its
+default Artifact Registry push permissions for the final "update the job"
+step to succeed.
 
 ## Deploying to Google Cloud
 

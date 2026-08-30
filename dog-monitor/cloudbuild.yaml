@@ -1,0 +1,61 @@
+# Builds the container image and pushes it to Artifact Registry, then
+# updates the existing Cloud Run Job to use the new image.
+#
+# Usage:
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions=_REGION=us-east1,_REPO=dog-monitor-repo,_IMAGE_NAME=dog-monitor,_JOB_NAME=dog-monitor-job
+#
+# The Cloud Run Job (_JOB_NAME) must already exist -- see README.md's
+# "Create the Cloud Run Job" step, which only needs to be run once. This
+# pipeline is for redeploying a new image to that existing job (e.g. wired
+# up as a Cloud Build trigger on pushes to main).
+#
+# The build service account needs roles/run.developer (to update the job)
+# in addition to the default Cloud Build permissions for Artifact Registry.
+
+substitutions:
+  _REGION: us-east1
+  _REPO: dog-monitor-repo
+  _IMAGE_NAME: dog-monitor
+  _JOB_NAME: dog-monitor-job
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:$SHORT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:latest'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-sha
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:$SHORT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push-latest
+    args:
+      - 'push'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:latest'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'jobs'
+      - 'update'
+      - '${_JOB_NAME}'
+      - '--region=${_REGION}'
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:$SHORT_SHA'
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:$SHORT_SHA'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE_NAME}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
