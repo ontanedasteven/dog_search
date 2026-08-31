@@ -22,9 +22,13 @@ git clone ...
 cd dog-monitor
 
 python -m venv venv
+
 pip install -r requirements.txt
+
 playwright install chromium
+
 pytest
+
 python -m dog_monitor.main
 
 ## What It Does
