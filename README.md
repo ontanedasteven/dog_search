@@ -16,6 +16,21 @@ This project automates that process: it scans a configurable list of
 shelter sources on a schedule, classifies each listing against your
 target breeds, and emails you when something new matches.
 
+## Quick Start
+
+git clone ...
+cd dog-monitor
+
+python -m venv venv
+
+pip install -r requirements.txt
+
+playwright install chromium
+
+pytest
+
+python -m dog_monitor.main
+
 ## What It Does
 
 - Scrapes a list of shelter/adoption sources you configure (see
