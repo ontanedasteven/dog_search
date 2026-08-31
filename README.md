@@ -65,10 +65,15 @@ of four confidence tiers, from a listing's free-text breed field:
 
 The current target breeds are Cairn Terrier, Norwich Terrier, Norfolk
 Terrier, and appropriately-sized generic Terrier/Terrier Mix candidates.
-These rules -- and the target breed list itself -- are a single,
-self-contained, pure-Python module with no scraping/storage/email
-dependencies; see its module docstring and `tests/test_matching.py` for
-every rule's exact behavior, including the weight-boundary edge cases.
+
+**To retarget this monitor at different breeds**, edit
+[`dog_monitor/breeds.py`](dog_monitor/breeds.py) -- the three term lists
+(`EXACT_TERMS`, `STRONG_TERMS`, `POSSIBLE_TERMS`) and the weight window
+live there, deliberately separated from the classification algorithm in
+`matching.py`, the same way shelter sources are centralized in
+`sources.py` rather than scattered through orchestration. Then run
+`pytest tests/test_matching.py tests/test_breeds.py -v` -- every existing
+rule, including the weight-boundary edge cases, has a dedicated test.
 
 ## Architecture
 
@@ -78,7 +83,7 @@ each can be reasoned about (and replaced) independently:
 ```
 Core application
 ├── source scrapers    (dog_monitor/scrapers/, dispatched via sources.py)
-├── matching           (dog_monitor/matching.py -- pure, no I/O)
+├── matching           (dog_monitor/matching.py -- pure, no I/O; target breeds in breeds.py)
 ├── deduplication       (dog_monitor/database.py's upsert/should_alert logic)
 └── alerts              (dog_monitor/alerts.py -- Gmail SMTP)
 
@@ -126,9 +131,10 @@ concern, not an application rewrite.
 dog_search/
 ├── dog_monitor/
 │   ├── sources.py            # the source registry -- start here to add/edit a shelter
+│   ├── breeds.py             # target breed terms + weight window -- start here to change what's matched
 │   ├── config.py             # env-var configuration
 │   ├── database.py           # Firestore-backed dedup/alert-state store
-│   ├── matching.py           # breed classification + ID/weight extraction (pure, unit-tested)
+│   ├── matching.py           # breed classification algorithm + ID/weight extraction (pure, unit-tested)
 │   ├── models.py             # Animal / MatchLevel / MatchResult dataclasses
 │   ├── alerts.py             # Gmail SMTP email composition + sending
 │   ├── logging_config.py     # stdlib logging setup

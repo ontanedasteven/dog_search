@@ -2,39 +2,17 @@
 
 This module has no dependencies on Playwright, SQLite, or email -- it is
 pure text-processing so it can be exhaustively unit tested independent of
-any scraper or network access.
+any scraper or network access. The target breed list itself lives in
+`dog_monitor/breeds.py`, not here -- see that module to change what this
+monitor looks for; this module only implements the matching algorithm.
 """
 
 import hashlib
 import re
 from typing import List, Optional
 
+from .breeds import EXACT_TERMS, MAX_POSSIBLE_WEIGHT_LB, MIN_POSSIBLE_WEIGHT_LB, POSSIBLE_TERMS, STRONG_TERMS
 from .models import MatchLevel, MatchResult
-
-# Ordered longest-first within each tier so the more specific phrase is
-# reported as the matched_term (e.g. "Cairn Terrier Mix" over "Cairn Terrier").
-EXACT_TERMS: List[str] = [
-    "Cairn Terrier Mix",
-    "Cairn Mix",
-    "Cairn Terrier",
-    "Norwich Terrier Mix",
-    "Norwich Mix",
-    "Norwich Terrier",
-]
-
-STRONG_TERMS: List[str] = [
-    "Norfolk Terrier Mix",
-    "Norfolk Terrier",
-]
-
-POSSIBLE_TERMS: List[str] = [
-    "Small Terrier",
-    "Terrier Mix",
-    "Terrier",
-]
-
-MIN_POSSIBLE_WEIGHT_LB = 5.0
-MAX_POSSIBLE_WEIGHT_LB = 30.0
 
 _WEIGHT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:lbs?\.?|pounds?)\b", re.IGNORECASE)
 _ANIMAL_ID_RE = re.compile(r"\bA\d{6,8}\b")
