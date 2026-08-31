@@ -18,18 +18,22 @@ target breeds, and emails you when something new matches.
 
 ## Quick Start
 
-git clone ...
-cd dog-monitor
+```bash
+git clone https://github.com/ontanedasteven/dog_search.git
+cd dog_search
 
-python -m venv venv
-
+python3 -m venv venv
+source venv/bin/activate       # venv\Scripts\activate on Windows
 pip install -r requirements.txt
-
 playwright install chromium
+cp .env.example .env           # fill in your own values -- this file is gitignored
 
-pytest
+pytest                         # 92 tests, no GCP account or network needed
+python -m dog_monitor.main     # one full scan against real sources
+```
 
-python -m dog_monitor.main
+See "Local Development" below for more detail, including running against
+the Firestore emulator instead of a real GCP project.
 
 ## What It Does
 
