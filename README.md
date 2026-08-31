@@ -35,6 +35,22 @@ python -m dog_monitor.main     # one full scan against real sources
 See "Local Development" below for more detail, including running against
 the Firestore emulator instead of a real GCP project.
 
+**To point this at your own shelters and breeds**, before running it for
+real:
+
+- Edit [`dog_monitor/sources.py`](dog_monitor/sources.py) to add, remove,
+  or change which shelters/agencies are monitored (see "Adding a
+  Shelter" below).
+- Edit [`dog_monitor/breeds.py`](dog_monitor/breeds.py) to change which
+  breeds it looks for (see "Current Breed Matching" below).
+
+Both are plain, self-contained config files kept separate from the
+scraping/matching code, specifically so this fork-and-run step doesn't
+require reading the rest of the codebase. Re-run `pytest` after editing
+either -- `tests/test_sources.py` and `tests/test_breeds.py` catch
+common mistakes (a missing required field, a duplicated breed term)
+immediately.
+
 ## What It Does
 
 - Scrapes a list of shelter/adoption sources you configure (see
