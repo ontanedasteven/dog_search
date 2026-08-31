@@ -2,16 +2,13 @@
 engine for card-grid pet listing pages, reused by both Humane Society
 scrapers.
 
-IMPORTANT SELECTOR CAVEAT: the CSS selectors used by HumaneSocietyCardScraper
-subclasses are best-effort guesses at common shelter-site markup patterns.
-This project was built in a sandboxed environment with no outbound network
-access to the live shelter sites, so the selectors were NOT verified against
-the real rendered DOM. On first real deployment, watch the logs for
-"Could not locate any pet card elements" warnings -- that means the live
-markup differs and the `card_selectors` list in the relevant scraper module
-needs to be updated after inspecting the real page (e.g. via browser
-devtools). The engine is written so that updating selectors is the only
-change needed; the parsing/extraction logic below is markup-agnostic.
+Both subclasses' primary `card_selectors` entry and the age/sex extraction
+in `_parse_card` were verified against the real rendered DOM on 2026-08-31
+(see the per-scraper module docstrings for what each site's markup looks
+like). If a future site redesign breaks a selector, the log will show
+"Could not locate any pet card elements" -- re-inspect the live page
+(devtools) and update `card_selectors` in the relevant scraper module; the
+parsing/extraction logic below is otherwise markup-agnostic.
 """
 
 import logging
@@ -169,8 +166,8 @@ class HumaneSocietyCardScraper(BaseScraper):
         breed_text = text
         weight = extract_weight(text)
         animal_id = extract_animal_id(text)
-        age = self._extract_labelled(text, ["age"])
-        sex = self._extract_labelled(text, ["sex", "gender"])
+        age = self._extract_age(text)
+        sex = self._extract_sex(text)
 
         match = classify_breed(breed_text, weight=weight)
 
@@ -198,9 +195,24 @@ class HumaneSocietyCardScraper(BaseScraper):
         )
 
     @staticmethod
-    def _extract_labelled(text: str, labels: List[str]) -> Optional[str]:
-        for label in labels:
-            m = re.search(rf"{label}\s*[:\-]?\s*([A-Za-z0-9]+)", text, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        return None
+    def _extract_sex(text: str) -> Optional[str]:
+        # Verified live on 2026-08-31: neither Humane Broward ("...Male\n7
+        # years...") nor Humane Miami ("...●\nFemale\n●...") label
+        # this field -- "Male"/"Female" appear as a bare standalone word.
+        m = re.search(r"\b(Male|Female)\b", text, re.IGNORECASE)
+        return m.group(1).title() if m else None
+
+    _AGE_RE = re.compile(
+        r"\d+\s*(?:years?|months?|weeks?|days?)(?:\s+\d+\s*(?:years?|months?|weeks?|days?))*",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _extract_age(cls, text: str) -> Optional[str]:
+        # Verified live: Broward uses "7 years – 11.00 lbs." (age and
+        # weight on one line); Miami uses "3 years 8 months 14 days"
+        # (no label). This matches a chained years/months/weeks/days
+        # expression without requiring a preceding "age:" label, and won't
+        # match weight text since that's always lbs/pounds-suffixed.
+        m = cls._AGE_RE.search(text)
+        return m.group(0).strip() if m else None
