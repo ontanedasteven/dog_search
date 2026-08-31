@@ -72,31 +72,53 @@ every rule's exact behavior, including the weight-boundary edge cases.
 
 ## Architecture
 
+The codebase is organized in three layers, deliberately kept separate so
+each can be reasoned about (and replaced) independently:
+
 ```
-Cloud Scheduler
-    |
-    v
-Cloud Run Job  (or: `python -m dog_monitor.main` locally)
-    |
-    v
-Source adapters / scrapers   (dog_monitor/scrapers/, dispatched via sources.py)
-    |
-    v
-Breed matching   (dog_monitor/matching.py)
-    |
-    v
-Firestore   (dedup + alert-sent state; SQLite-shaped, but Firestore-only today)
-    |
-    v
-Email alerts   (Gmail SMTP)
+Core application
+├── source scrapers    (dog_monitor/scrapers/, dispatched via sources.py)
+├── matching           (dog_monitor/matching.py -- pure, no I/O)
+├── deduplication       (dog_monitor/database.py's upsert/should_alert logic)
+└── alerts              (dog_monitor/alerts.py -- Gmail SMTP)
+
+Persistence
+└── Firestore adapter   (dog_monitor/database.py -- the only backend shipped today)
+
+Deployment
+├── local Python         (`python -m dog_monitor.main`)
+├── Docker                (Dockerfile)
+└── Google Cloud reference deployment   (Cloud Run Job + Cloud Scheduler + Secret Manager)
 ```
 
-The application is a single stateless batch job: each run scrapes every
-enabled source, classifies and dedups matches against Firestore, and
-sends one grouped email for anything newly matched. All of this **runs
-locally** with no Google Cloud account at all except for the persistence
-layer -- see "Local Development" below, including running against the
-Firestore emulator instead of real GCP.
+One run's data flow, regardless of which deployment layer triggers it:
+
+```
+(trigger: Cloud Scheduler, or you running it directly)
+    |
+    v
+Entry point  (`python -m dog_monitor.main`, same code whether local or in a container)
+    |
+    v
+Source adapters / scrapers   ->   Breed matching   ->   Persistence (dedup + alert-sent state)   ->   Email alerts
+```
+
+**Google Cloud is not required.** The reference deployment described
+below uses Cloud Run, Firestore, Secret Manager, and Cloud Scheduler
+because that's what this maintainer's own instance runs on, but the
+application itself only depends on a Firestore-compatible persistence
+layer -- which includes the local Firestore emulator, requiring no GCP
+account at all (see "Local Development"). Nothing about the core
+application, scrapers, matching, or alerting logic is GCP-specific. The
+persistence layer is accessed through a small, focused interface
+(`upsert_animal`, `should_alert`, `mark_alert_sent`, `start_source_run`,
+...) — a local SQLite adapter implementing that same interface is a
+natural, self-contained first contribution for anyone who wants to run
+without Firestore too (see `CONTRIBUTING.md`); none is implemented yet.
+Likewise, "Cloud Run Job" is one way to run a container on a schedule --
+the Dockerfile and `main.py` don't assume Cloud Run specifically, so
+adapting to another container host is mostly a scheduling/secrets
+concern, not an application rewrite.
 
 ## Project Structure
 
