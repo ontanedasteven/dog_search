@@ -36,9 +36,8 @@ from .database import FirestoreStore
 from .logging_config import configure_logging
 from .models import Animal, MatchLevel
 from .scrapers.base import BaseScraper, ScraperError
-from .scrapers.humane_broward import HumaneBrowardScraper
-from .scrapers.humane_miami import HumaneMiamiScraper
-from .scrapers.petconnect import PetConnectScraper
+from .scrapers.registry import build_scraper
+from .sources import enabled_sources
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +48,19 @@ FULL_SCAN_INTERVAL_HOURS = 96
 
 
 def build_scrapers(headless: bool) -> List[BaseScraper]:
-    return [
-        HumaneBrowardScraper(headless=headless),
-        HumaneMiamiScraper(headless=headless),
-        PetConnectScraper(agency_code="BRWD", region="Broward", headless=headless),
-        PetConnectScraper(agency_code="MIAD", region="Miami-Dade", headless=headless),
-    ]
+    """Build one scraper per enabled source in the registry (see
+    sources.py), dispatching through scrapers.registry. Adding, removing,
+    or disabling a source is a sources.py edit -- this function itself
+    never needs to change for that."""
+    return [build_scraper(source, headless) for source in enabled_sources()]
 
 
 def run_source(db: FirestoreStore, browser, scraper: BaseScraper) -> List[Animal]:
-    """Run a single scraper. Never raises -- failures are logged and
-    recorded in source_runs so the rest of the sources still run."""
+    """Source failure isolation: run a single scraper and never let it
+    raise past this function. Both a deliberate ScraperError (the source's
+    workflow couldn't complete) and any unexpected exception are caught,
+    logged, and recorded in source_runs -- so one broken/changed site
+    never prevents the other sources in the same run from being scraped."""
     run_id = db.start_source_run(scraper.source_name)
     logger.info("Starting source: %s", scraper.source_name)
     try:
@@ -113,6 +114,17 @@ def process_matches(db: FirestoreStore, matches: List[Animal]) -> List[Animal]:
 
 
 def send_pending_alerts(db: FirestoreStore, config: Config, alertable: List[Animal]) -> None:
+    """Send one grouped email for all pending animals, and only then mark
+    them alerted.
+
+    Failed-email retry behavior: `mark_alert_sent` is only called after a
+    *confirmed* successful send. A transient SMTP failure (bad
+    credentials, network blip) leaves every affected animal's
+    `alert_sent` as False in Firestore, so `should_alert()` picks the
+    same animals back up on the very next run -- no alert is silently
+    dropped because of a one-time send failure, and no extra state is
+    needed to track "pending retry" separately from "not yet alerted."
+    """
     if not alertable:
         logger.info("No new matches requiring alerts this run.")
         return

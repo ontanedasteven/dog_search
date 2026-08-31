@@ -1,13 +1,19 @@
-"""Humane Society of Broward County -- all-pets listing scraper."""
+"""Humane Society of Broward County -- all-pets listing scraper.
+
+`url` and `region` are supplied by the caller (see sources.py's
+"humane-broward" entry and scrapers/registry.py) rather than hardcoded
+here, so this class only needs to carry markup knowledge specific to this
+site's card grid.
+"""
 
 from .base import HumaneSocietyCardScraper
 
 
 class HumaneBrowardScraper(HumaneSocietyCardScraper):
+    # Stable Firestore/dedup identity for this source. Existing
+    # `animals`/`sightings`/`source_runs` documents are keyed off this
+    # exact string -- do not change it without a data migration.
     source_name = "humane_broward"
-    region = "Broward"
-    url = "https://humanebroward.com/all-pets/?pg=1"
-    base_url = "https://humanebroward.com"
 
     # Verified live on 2026-08-31: cards are `<div class="pet-item">`
     # containing a nested `<a class="pet-item-link">`. The nested anchor's

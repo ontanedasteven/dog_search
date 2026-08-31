@@ -1,8 +1,27 @@
-venv/
+# Python
 __pycache__/
 *.pyc
-.env
-logs/
-.pytest_cache/
 *.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment / secrets -- never commit real credentials. .env.example is
+# a tracked template with empty values and is explicitly un-ignored below.
+.env
+.env.*
+!.env.example
+
+# Keys and service-account credentials
+*.pem
+*.key
+service-account*.json
+credentials*.json
+
+# Local runtime output
+logs/
+
+# OS
 .DS_Store

@@ -1,418 +1,319 @@
 # Dog Monitor
 
-Scans four Miami-Dade / Broward animal-shelter adoption sources for Cairn
-Terriers, Norwich Terriers, Norfolk Terriers (strong possible), and generic
-small terriers (lower-confidence possible), and emails an alert when a new
-match appears. Built to run as a **Google Cloud Run Job** on a schedule,
-using **Firestore** as the only persistent state (the container itself is
-stateless between executions).
+A self-hosted, extensible framework for monitoring animal-shelter adoption
+listings for specific breeds, and emailing an alert when a match appears.
+
+## Problem
+
+There is no single reliable database containing every local shelter's
+available animals. Someone looking for a particular breed -- a Cairn
+Terrier, say -- may have to repeatedly, manually check multiple Humane
+Societies, municipal shelters, and third-party adoption platforms, each
+with their own site and no shared search. Listings change daily and
+nothing notifies you when a match appears.
+
+This project automates that process: it scans a configurable list of
+shelter sources on a schedule, classifies each listing against your
+target breeds, and emails you when something new matches.
+
+## What It Does
+
+- Scrapes a list of shelter/adoption sources you configure (see
+  [`dog_monitor/sources.py`](dog_monitor/sources.py)).
+- Classifies each listing's breed text into a confidence tier (see
+  "Current Breed Matching" below).
+- Deduplicates against previously-seen animals so you're only alerted
+  once per new match, using a stable identifier where the source
+  provides one, or a deterministic fingerprint where it doesn't.
+- Emails a single grouped alert for anything newly matched (or not yet
+  successfully alerted) each time it runs.
+- Runs as a single, stateless batch job -- no server, no frontend, no
+  database to administer beyond the persistence layer it already uses.
+
+## Current Coverage
+
+This is a **reference implementation**. Out of the box it monitors two
+Florida counties:
+
+| Source | Region | Platform |
+|---|---|---|
+| Humane Society of Broward County | Broward County, FL | own site |
+| Broward County Animal Care | Broward County, FL | 24Petconnect (agency `BRWD`) |
+| Humane Society of Greater Miami | Miami-Dade County, FL | own site |
+| Miami-Dade Animal Services | Miami-Dade County, FL | 24Petconnect (agency `MIAD`) |
+
+This list lives entirely in [`dog_monitor/sources.py`](dog_monitor/sources.py) --
+see "Adding a Shelter" below for how to extend it to other counties,
+states, or countries.
+
+## Current Breed Matching
+
+Breed classification (`dog_monitor/matching.py`) assigns each listing one
+of four confidence tiers, from a listing's free-text breed field:
+
+- **EXACT** -- an unambiguous match on a target breed, e.g. "Cairn
+  Terrier", "Cairn Terrier Mix", "Norwich Terrier".
+- **STRONG** -- a closely related target breed, e.g. "Norfolk Terrier".
+- **POSSIBLE** -- a generic label ("Terrier", "Terrier Mix", "Small
+  Terrier") that *could* be a target breed, kept only if the listing's
+  weight is unknown or falls within a plausible small-terrier range
+  (5-30 lb). This deliberately favors false positives over false
+  negatives: an unknown-weight generic "Terrier Mix" is kept rather than
+  silently dropped, since some sources never publish weight at all.
+- **NONE** -- everything else, including a generic "Terrier" label whose
+  known weight rules it out (e.g. a 60 lb "Pit Bull Terrier").
+
+The current target breeds are Cairn Terrier, Norwich Terrier, Norfolk
+Terrier, and appropriately-sized generic Terrier/Terrier Mix candidates.
+These rules -- and the target breed list itself -- are a single,
+self-contained, pure-Python module with no scraping/storage/email
+dependencies; see its module docstring and `tests/test_matching.py` for
+every rule's exact behavior, including the weight-boundary edge cases.
 
 ## Architecture
 
-- **Compute**: a single-container Cloud Run Job (`python -m dog_monitor.main`)
-  that runs to completion once per execution and exits. No server, no long-
-  running process.
-- **State**: Firestore (four collections: `animals`, `sightings`,
-  `source_runs`, `monitor_state`). This is the *only* thing that persists
-  between runs -- the container's local filesystem is discarded after each
-  execution.
-- **Scheduling**: Cloud Scheduler triggers a Cloud Run Job execution **once
-  per day**. The application itself enforces the true "once every 4 days"
-  requirement: on each invocation it reads `monitor_state.last_successful_full_scan`
-  from Firestore, and if fewer than 96 hours have elapsed it logs that the
-  scan isn't due and exits successfully without scraping anything. This is a
-  real rolling 96-hour window, not a calendar-based cron approximation (see
-  `main.is_scan_due` / `FULL_SCAN_INTERVAL_HOURS`).
-- **Scraping**: Playwright + Chromium (headless), one scraper module per
-  source, sharing a small generic engine for the two Humane Society sites.
-- **Alerts**: Gmail SMTP via `smtplib`, using an App Password from Secret
-  Manager.
+```
+Cloud Scheduler
+    |
+    v
+Cloud Run Job  (or: `python -m dog_monitor.main` locally)
+    |
+    v
+Source adapters / scrapers   (dog_monitor/scrapers/, dispatched via sources.py)
+    |
+    v
+Breed matching   (dog_monitor/matching.py)
+    |
+    v
+Firestore   (dedup + alert-sent state; SQLite-shaped, but Firestore-only today)
+    |
+    v
+Email alerts   (Gmail SMTP)
+```
+
+The application is a single stateless batch job: each run scrapes every
+enabled source, classifies and dedups matches against Firestore, and
+sends one grouped email for anything newly matched. All of this **runs
+locally** with no Google Cloud account at all except for the persistence
+layer -- see "Local Development" below, including running against the
+Firestore emulator instead of real GCP.
+
+## Project Structure
 
 ```
 dog-monitor/
 ├── dog_monitor/
-│   ├── config.py            # env-var configuration
-│   ├── database.py          # Firestore-backed dedup/alert-state store
-│   ├── matching.py          # breed classification + ID/weight extraction (pure, unit-tested)
-│   ├── models.py            # Animal / MatchLevel / MatchResult dataclasses
-│   ├── alerts.py            # Gmail SMTP email composition + sending
-│   ├── logging_config.py    # stdlib logging setup
-│   ├── main.py               # orchestration entry point
+│   ├── sources.py            # the source registry -- start here to add/edit a shelter
+│   ├── config.py             # env-var configuration
+│   ├── database.py           # Firestore-backed dedup/alert-state store
+│   ├── matching.py           # breed classification + ID/weight extraction (pure, unit-tested)
+│   ├── models.py             # Animal / MatchLevel / MatchResult dataclasses
+│   ├── alerts.py             # Gmail SMTP email composition + sending
+│   ├── logging_config.py     # stdlib logging setup
+│   ├── main.py                # orchestration entry point
 │   └── scrapers/
-│       ├── base.py                # BaseScraper + generic pet-card engine
-│       ├── humane_broward.py      # Humane Society of Broward County
-│       ├── humane_miami.py        # Humane Society of Greater Miami
-│       └── petconnect.py          # 24Petconnect (BRWD + MIAD agencies)
-├── tests/                    # pytest suite (matching, Firestore dedup, petconnect URL parsing)
+│       ├── registry.py            # maps a source's `type` to the right scraper -- start here for a new source type
+│       ├── base.py                # BaseScraper interface + generic pet-card engine
+│       ├── humane_broward.py      # Humane Society of Broward County adapter
+│       ├── humane_miami.py        # Humane Society of Greater Miami adapter
+│       └── petconnect.py          # 24Petconnect adapter (any agency code)
+├── tests/                     # pytest suite -- see "Testing" below
+├── docs/
+│   └── DEPLOYMENT.md          # detailed Google Cloud deployment runbook
 ├── Dockerfile
 ├── requirements.txt
-├── cloudbuild.yaml           # Cloud Build pipeline: build -> push -> update the Cloud Run Job
+├── cloudbuild.yaml            # Cloud Build pipeline: test -> build -> push -> deploy
 ├── .env.example
+├── LICENSE
+├── CONTRIBUTING.md
 └── README.md
 ```
 
-## IMPORTANT: selectors were not verified against live sites
+## Adding a Shelter
 
-This project was built in a sandboxed environment with **no outbound network
-access** to humanebroward.com, humanesocietymiami.org, or 24petconnect.com
-(only package registries were reachable). The CSS selectors in
-`scrapers/humane_broward.py`, `scrapers/humane_miami.py`, and the search-UI
-selectors in `scrapers/petconnect.py` are best-effort guesses at common
-shelter-site/24Petconnect markup patterns -- **they have not been confirmed
-against the real rendered DOM.**
+Source metadata is centralized in `dog_monitor/sources.py` specifically
+so that **adding a shelter should not require touching `main.py`**.
+Orchestration just iterates `sources.enabled_sources()` and dispatches
+each entry through `scrapers/registry.py` -- neither of those needs to
+change for a source that fits an existing type.
 
-The scrapers are written defensively for this: each tries several candidate
-selectors, and if none match, the source fails gracefully with a clear log
-warning (`Could not locate any pet card elements...` / `No detail links
-found...` / `Search workflow failed...`) and is recorded as a failed row in
-`source_runs` -- it will **not** silently return wrong data, and it will
-**not** stop the other three sources from running.
+**If the new shelter uses a platform already supported** (currently
+24Petconnect, or a WordPress/CMS-style "pet card" grid like the two
+Humane Society sites), adding it is a `sources.py` edit:
 
-**Before relying on this in production**, run it once for real (see "Manual
-test run" below), watch the logs, and if you see those warnings:
+```python
+SourceConfig(
+    id="humane-yourcity",
+    name="Humane Society of Your City",
+    region="Your County, ST",
+    type="humane",
+    url="https://example.org/adopt/",
+    parser="humane_yourcity",   # a new HumaneSocietyCardScraper subclass, see below
+),
+```
 
-1. Open the page in a real browser, open devtools, and find the actual
-   selector for the pet-card grid (Humane Society sites) or the search
-   form's species filter / location field / submit button (24Petconnect).
-2. Update `card_selectors` in the relevant `scrapers/*.py` file (Humane
-   Society), or the candidate-selector tuples inside
-   `PetConnectScraper._run_search` (24Petconnect).
-3. Re-run and confirm `animals_scanned` and `matches_found` in the logs look
-   sane.
+For a `"humane"`-type source you'll typically also add a small adapter
+(most of the parsing logic is shared):
 
-## Local development and testing
+```python
+# dog_monitor/scrapers/humane_yourcity.py
+from .base import HumaneSocietyCardScraper
 
-### 1. Set up the environment
+class HumaneYourCityScraper(HumaneSocietyCardScraper):
+    source_name = "humane_yourcity"   # stable Firestore/dedup key -- see below
+    card_selectors = [".pet-card", ...]  # verified against the live site
+```
+
+...then register it in `scrapers/registry.py`'s `_HUMANE_PARSERS` dict.
+A `"24petconnect"`-type source needs no new code at all -- just an
+`agency_code` in its `sources.py` entry.
+
+**If the new shelter needs a genuinely new scraping strategy** (a
+different platform, e.g. Petfinder or ShelterLuv), implement a new
+`BaseScraper` subclass and add one factory function + one entry to
+`SCRAPER_REGISTRY` in `scrapers/registry.py`. That's the only file that
+maps a source `type` string to actual scraper construction, so a future
+`type: "petfinder"` or `type: "shelterluv"` doesn't require rewriting
+orchestration.
+
+One important stability note: each scraper's `source_name` (e.g.
+`"humane_broward"`) is written into Firestore and folded into dedup
+fingerprint keys for sources without a native animal ID -- pick it once
+and don't change it after real data exists. See `CONTRIBUTING.md`'s
+"Adding a New Shelter" section for the full contribution checklist,
+including tests.
+
+## Configuration
+
+All configuration is environment variables (see `.env.example` for the
+full list with no real values):
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `EMAIL_FROM` | for alerts | Gmail address alerts are sent from |
+| `EMAIL_TO` | for alerts | address alerts are sent to |
+| `EMAIL_PASSWORD` | for alerts | a Gmail **App Password**, not your account password |
+| `HEADLESS` | no (default `true`) | run Chromium headless; set `false` to watch it locally |
+| `LOG_LEVEL` | no (default `INFO`) | stdlib logging level |
+| `FIRESTORE_PROJECT_ID` | no | usually auto-detected from `GOOGLE_CLOUD_PROJECT` in Cloud Run |
+| `FIRESTORE_DATABASE_ID` | no | only needed for a named (non-default) Firestore database |
+| `FIRESTORE_EMULATOR_HOST` | no | point at a local Firestore emulator instead of real GCP |
+
+Missing email configuration is not fatal -- a scan still runs and stores
+matches in Firestore; alerting is just skipped (with a logged warning)
+until it's configured, and pending matches are retried on the next run.
+
+## Local Development
 
 ```bash
-git clone <this-repo>
-cd dog-monitor
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate       # venv\Scripts\activate on Windows
 pip install -r requirements.txt
 playwright install chromium
+cp .env.example .env           # fill in your own values; this file is gitignored
+pytest                         # no GCP account needed -- see "Testing" below
+python -m dog_monitor.main     # one full scan against real sources
 ```
 
-### 2. Configure environment variables
+Set `HEADLESS=false` in `.env` to watch the browser while debugging a
+scraper. To exercise the app against real Firestore semantics without a
+real GCP project, run the Firestore emulator:
 
 ```bash
-cp .env.example .env
-# edit .env: EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD (see Gmail App Password below)
+gcloud emulators firestore start --host-port=localhost:8080
+# in another terminal:
+export FIRESTORE_EMULATOR_HOST=localhost:8080
+export FIRESTORE_PROJECT_ID=demo-test   # any non-empty value works against the emulator
+python -m dog_monitor.main
 ```
 
-### 3. Run the unit test suite (no GCP account needed)
+## Google Cloud Deployment
+
+The reference deployment target is a Cloud Run Job, triggered daily by
+Cloud Scheduler, using Firestore for persistence, Secret Manager for
+email credentials, and Cloud Build to test/build/push/deploy the
+container. This is one deployment option, not a requirement -- the
+application only needs Firestore (or the emulator) and a place to run a
+container to completion on a schedule.
+
+See **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)** for the full,
+copy-pasteable setup: enabling APIs, creating the Firestore database and
+Artifact Registry repo, IAM, secrets, creating the job, and scheduling
+it.
+
+## Testing
 
 ```bash
 pytest
 ```
 
-The matching/ID/weight tests are pure Python. The database/dedup tests run
-against an in-memory fake Firestore client (`tests/fakes.py`) that
-implements the same `collection().document().get()/set()/update()` surface
-`FirestoreStore` uses -- fast, deterministic, and requires no network or
-credentials. This is intentionally *not* a full emulator (no transactions,
-queries, or server timestamps); it validates dedup/alert logic, not
-Firestore's own behavior.
+No GCP account or network access is required: matching/extraction logic
+is pure Python, Firestore interactions run against an in-memory fake
+client (`tests/fakes.py`), and scraper parsing tests exercise real
+field-extraction logic against literal text samples captured from the
+live sites -- rather than requiring a live browser session in CI.
 
-### 4. (Recommended) Validate against the real Firestore emulator
-
-Before your first deploy, also exercise the app against the actual
-Firestore emulator, which behaves like real Firestore (requires the Google
-Cloud SDK):
+If `pytest-cov` is installed:
 
 ```bash
-gcloud components install cloud-firestore-emulator
-gcloud emulators firestore start --host-port=localhost:8080
+pytest --cov
 ```
 
-In another terminal:
+The suite covers source-registry validation, breed matching, weight/ID
+extraction, scraper parsing (Humane Society card fields, 24Petconnect
+list/pagination/detail parsing), Firestore-backed deduplication and
+alert-retry state, the 96-hour scan guard, and orchestration behavior
+(source failure isolation, disabled-source skipping). It does not cover
+live-browser/network behavior -- parsing tests run against literal text
+samples captured from the real sites rather than a live Playwright
+session, so a scraper can still break if a site's markup changes even
+though its tests keep passing; see "Responsible Scraping" above.
 
-```bash
-export FIRESTORE_EMULATOR_HOST=localhost:8080
-export FIRESTORE_PROJECT_ID=demo-test   # any non-empty value works against the emulator
-source venv/bin/activate
-python -m dog_monitor.main
-```
+## Contributing
 
-Because `FIRESTORE_EMULATOR_HOST` is set, the `google-cloud-firestore`
-client automatically talks to the local emulator instead of real GCP --
-no credentials required. Inspect what got written via the emulator's admin
-UI (printed in its startup logs) or `gcloud firestore` commands pointed at
-the emulator.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full process, including
+the preferred way to add a new shelter.
 
-### 5. Manual test run against real sources
+## Responsible Scraping
 
-```bash
-source venv/bin/activate
-python -m dog_monitor.main
-```
+- Respect each source site's terms of use. This project doesn't ship
+  with permission from any shelter or platform to scrape it -- that's
+  each operator's responsibility to confirm for their own use.
+- Use conservative request rates. Scrapers here deliberately pace
+  requests (see `PAGE_LOAD_DELAY_SECONDS`, `DETAIL_PAGE_DELAY_SECONDS` in
+  `scrapers/petconnect.py`) and only visit a listing's detail page when
+  it's already a breed match, not for every listing scanned.
+- Do not aggressively crawl sites. This is a periodic monitor (every few
+  days), not a real-time crawler -- don't reduce the scan interval or
+  strip pacing to get fresher data faster.
+- Individual source implementations may break when a site's markup
+  changes; that's expected maintenance, not a design flaw. Each scraper
+  fails independently (see "Source failure isolation" below) and logs a
+  clear warning rather than silently returning wrong data.
+- Contributors are responsible for ensuring their own source
+  implementations comply with the target site's terms and any applicable
+  legal requirements in their jurisdiction.
 
-This performs one full scan of all four sources and prints/logs progress.
-Set `HEADLESS=false` in `.env` to watch the browser while debugging
-selectors.
+## Non-Goals
 
-## Gmail App Password
+This project explicitly does **not** intend to:
 
-`EMAIL_PASSWORD` must be a Gmail **App Password**, not your normal account
-password (Gmail rejects normal passwords for SMTP from third-party apps):
+- Operate a nationwide hosted service. There is no hosted public
+  instance; you fork or clone and run your own.
+- Provide a polished consumer frontend. It's a backend job that emails
+  you -- there is no UI, and none is planned in the base repository.
+- Guarantee permanent compatibility with third-party websites. Shelter
+  sites change their markup without notice; scrapers will need ongoing
+  maintenance.
+- Guarantee breed identification accuracy. Matching is based on
+  shelter-provided text and weight, which is often approximate,
+  inconsistent, or (for some sources) simply missing.
+- Replace official shelter records. Always confirm availability directly
+  with the shelter before making plans.
 
-1. Enable 2-Step Verification on the Gmail account: https://myaccount.google.com/security
-2. Go to https://myaccount.google.com/apppasswords
-3. Create an app password (choose "Mail" / "Other"), copy the 16-character
-   value, and use it as `EMAIL_PASSWORD`.
+## License
 
-## Containerizing
-
-```bash
-docker build -t dog-monitor:local .
-docker run --rm \
-  -e EMAIL_FROM=you@gmail.com \
-  -e EMAIL_TO=you@gmail.com \
-  -e EMAIL_PASSWORD=xxxxxxxxxxxxxxxx \
-  -e GOOGLE_CLOUD_PROJECT=your-gcp-project \
-  -v "$HOME/.config/gcloud:/root/.config/gcloud:ro" \
-  dog-monitor:local
-```
-
-(Mounting `~/.config/gcloud` lets the container use your local `gcloud auth
-application-default login` credentials for a local Docker smoke test against
-real Firestore. In Cloud Run itself, credentials come from the job's
-attached service account automatically -- no mounting needed.)
-
-The `Dockerfile`'s base image tag must match the `playwright` version pinned
-in `requirements.txt` (currently `1.55.0`) so the bundled Chromium build
-lines up -- if you bump one, bump the other. This repo's build environment
-had no network access to `mcr.microsoft.com` to confirm the exact tag
-string -- verify it resolves (`docker pull
-mcr.microsoft.com/playwright/python:v1.55.0-noble`) before your first
-build, and adjust to whatever tag Microsoft currently publishes for that
-Playwright version if it doesn't.
-
-`requirements.txt` also includes `google-cloud-secret-manager`. It is not
-currently imported by any application code -- the deploy steps below use
-Cloud Run's `--set-secrets` flag, which resolves Secret Manager secrets to
-plain environment variables before the container starts, so `config.py`
-just reads `os.getenv(...)` as usual. The dependency is there if you'd
-rather have the app fetch secrets directly via the Secret Manager API at
-runtime instead; that would need a small addition to `config.py` to call
-it, which isn't wired up here.
-
-### Building with Cloud Build directly
-
-`cloudbuild.yaml` runs the unit test suite (aborting the whole build if any
-test fails), then builds the image, pushes it to Artifact Registry tagged
-with both `$SHORT_SHA` and `latest`, and updates the (already-created)
-Cloud Run Job to use the `$SHORT_SHA`-tagged image -- useful once you've
-done the one-time `gcloud run jobs create` below and want repeatable,
-test-gated redeploys (manually or via a Cloud Build trigger on push):
-
-```bash
-gcloud builds submit --config cloudbuild.yaml \
-  --substitutions=_REGION=REGION,_REPO=dog-monitor-repo,_IMAGE_NAME=dog-monitor,_JOB_NAME=dog-monitor-job
-```
-
-The build service account needs `roles/run.developer` in addition to its
-default Artifact Registry push permissions for the final "update the job"
-step to succeed.
-
-## Deploying to Google Cloud
-
-Replace `PROJECT_ID` and `REGION` (e.g. `us-east1`) throughout.
-
-### 1. One-time project setup
-
-```bash
-gcloud config set project PROJECT_ID
-
-gcloud services enable \
-  run.googleapis.com \
-  firestore.googleapis.com \
-  cloudscheduler.googleapis.com \
-  artifactregistry.googleapis.com \
-  cloudbuild.googleapis.com \
-  secretmanager.googleapis.com
-
-# Create the Firestore database (Native mode) if this project doesn't have one yet.
-gcloud firestore databases create --location=REGION --type=firestore-native
-
-gcloud artifacts repositories create dog-monitor-repo \
-  --repository-format=docker \
-  --location=REGION
-```
-
-### 2. Store the email credentials as secrets
-
-```bash
-printf '%s' 'you@gmail.com'        | gcloud secrets create dog-monitor-email-from     --data-file=-
-printf '%s' 'you@gmail.com'        | gcloud secrets create dog-monitor-email-to       --data-file=-
-printf '%s' 'xxxxxxxxxxxxxxxx'     | gcloud secrets create dog-monitor-email-password --data-file=-
-```
-
-### 3. Create a dedicated service account for the job
-
-```bash
-gcloud iam service-accounts create dog-monitor-runner \
-  --display-name "Dog Monitor Cloud Run Job"
-
-# Firestore read/write access
-gcloud projects add-iam-policy-binding PROJECT_ID \
-  --member="serviceAccount:dog-monitor-runner@PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/datastore.user"
-
-# Access to the three secrets
-for secret in dog-monitor-email-from dog-monitor-email-to dog-monitor-email-password; do
-  gcloud secrets add-iam-policy-binding "$secret" \
-    --member="serviceAccount:dog-monitor-runner@PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/secretmanager.secretAccessor"
-done
-```
-
-### 4. Build and push the image
-
-```bash
-gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT_ID/dog-monitor-repo/dog-monitor:latest
-```
-
-### 5. Create the Cloud Run Job
-
-```bash
-gcloud run jobs create dog-monitor-job \
-  --image REGION-docker.pkg.dev/PROJECT_ID/dog-monitor-repo/dog-monitor:latest \
-  --region REGION \
-  --service-account dog-monitor-runner@PROJECT_ID.iam.gserviceaccount.com \
-  --tasks 1 \
-  --max-retries 1 \
-  --task-timeout 1800s \
-  --memory 1Gi \
-  --cpu 1 \
-  --set-env-vars LOG_LEVEL=INFO,HEADLESS=true \
-  --set-secrets EMAIL_FROM=dog-monitor-email-from:latest,EMAIL_TO=dog-monitor-email-to:latest,EMAIL_PASSWORD=dog-monitor-email-password:latest
-```
-
-`GOOGLE_CLOUD_PROJECT` is injected automatically by Cloud Run, so
-`FIRESTORE_PROJECT_ID` does not need to be set explicitly here.
-
-`--memory 1Gi --cpu 1` are conservative starting points and held up fine in
-live testing. The task timeout started at 900s (15 min) per the original
-spec but was raised to 1800s (30 min) after a live run against the real
-24Petconnect MIAD agency (745 listed animals -- Miami-Dade is a large
-county shelter) showed that visiting detail pages for every animal whose
-breed text contains "Terrier" as a substring (Pit Bull Terrier, American
-Staffordshire Terrier, Boston Terrier, etc. -- intentional, since any of
-these *could* individually be a legitimately small dog; see
-`matching.classify_breed`) for weight confirmation took longer than 900s
-combined with the other three sources. This is a background job on a
-4-day cadence, not latency-sensitive, so a longer ceiling is the right
-fix rather than reducing scan coverage. Watch actual usage in Cloud
-Monitoring after a few real executions and raise `--memory`/`--cpu`
-further only if needed (e.g. `gcloud run jobs update dog-monitor-job
---memory 2Gi --cpu 2 --region REGION`).
-
-### 6. Run it once manually to verify
-
-```bash
-gcloud run jobs execute dog-monitor-job --region REGION --wait
-```
-
-### 7. View logs
-
-```bash
-gcloud logging read \
-  'resource.type="cloud_run_job" AND resource.labels.job_name="dog-monitor-job"' \
-  --limit 200 --order asc --format='value(textPayload)'
-```
-
-or in the Cloud Console: Cloud Run -> Jobs -> dog-monitor-job -> Executions
--> (an execution) -> Logs.
-
-### 8. Schedule it with Cloud Scheduler
-
-Cloud Scheduler invokes the job **once per day** at 08:00 America/New_York;
-the application itself enforces the true 96-hour minimum interval between
-full scans (see "Architecture" above) by checking
-`monitor_state.last_successful_full_scan` in Firestore before scraping, so
-most daily invocations simply log "not due yet" and exit 0 immediately.
-This is deliberately *not* a `*/4` day-of-month cron expression -- unix-cron
-is calendar-based (it resets at month boundaries) and cannot express a true
-rolling 4-day interval, so the app enforces it in code instead.
-
-Create an invoker service account and the schedule:
-
-```bash
-gcloud iam service-accounts create dog-monitor-scheduler \
-  --display-name "Dog Monitor Scheduler Invoker"
-
-gcloud run jobs add-iam-policy-binding dog-monitor-job \
-  --region REGION \
-  --member="serviceAccount:dog-monitor-scheduler@PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/run.invoker"
-
-gcloud scheduler jobs create http dog-monitor-schedule \
-  --location REGION \
-  --schedule "0 8 * * *" \
-  --time-zone "America/New_York" \
-  --uri "https://REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT_ID/jobs/dog-monitor-job:run" \
-  --http-method POST \
-  --oauth-service-account-email dog-monitor-scheduler@PROJECT_ID.iam.gserviceaccount.com
-```
-
-Verify and test-fire it:
-
-```bash
-gcloud scheduler jobs describe dog-monitor-schedule --location REGION
-gcloud scheduler jobs run dog-monitor-schedule --location REGION
-```
-
-## Changing the breed rules
-
-All matching logic lives in `dog_monitor/matching.py` and is fully isolated
-from scraping/storage/email:
-
-- `EXACT_TERMS`, `STRONG_TERMS`, `POSSIBLE_TERMS`: the phrase lists for each
-  confidence tier (case-insensitive substring match).
-- `MIN_POSSIBLE_WEIGHT_LB` / `MAX_POSSIBLE_WEIGHT_LB`: the weight window
-  (inclusive) a generic "Terrier"/"Terrier Mix"/"Small Terrier" listing must
-  fall into to be kept as POSSIBLE when a weight is available.
-- `extract_weight()` / `extract_animal_id()`: the weight and animal-ID
-  regexes.
-
-After changing anything here, run `pytest tests/test_matching.py -v` --
-every rule in the spec (EXACT/STRONG/POSSIBLE cases, weight boundary
-behavior, ID extraction) has a dedicated test.
-
-## Adding/adjusting a source
-
-Each scraper implements `BaseScraper.scrape(browser) -> List[Animal]`
-(see `scrapers/base.py`) and is registered in `build_scrapers()` in
-`main.py`. The two Humane Society scrapers share a generic card-grid engine
-(`HumaneSocietyCardScraper`); a new similar WordPress-style source can
-usually be added by subclassing it with just a new `url`/`base_url`/
-`card_selectors`.
-
-## Troubleshooting
-
-- **"Could not locate any pet card elements..." / "No detail links
-  found..."**: the live site's markup differs from the guessed selectors.
-  See "IMPORTANT: selectors were not verified against live sites" above.
-- **Playwright can't find/launch Chromium**: make sure the `playwright`
-  version installed matches the Chromium build actually present (run
-  `playwright install chromium` after any `pip install -U playwright`).
-  Inside the container this is handled by pinning the Dockerfile's base
-  image tag to the same Playwright version as `requirements.txt`.
-- **Cloud Run Job runs out of memory**: headless Chromium plus several open
-  pages can use significant RAM; raise `--memory` on the job, or reduce
-  `DETAIL_PAGE_CONCURRENCY` in `scrapers/petconnect.py`.
-- **No email arrives**: check `EMAIL_FROM`/`EMAIL_TO`/`EMAIL_PASSWORD` are
-  all set and that `EMAIL_PASSWORD` is a Gmail **App Password** (16
-  characters, spaces optional), not the account password. Check the job's
-  logs for `Failed to send alert email` (full stack trace is logged).
-- **An animal seems to alert twice**: alerts are keyed by `animal_key`
-  (`SOURCE_PREFIX:ANIMAL_ID` for 24Petconnect, a SHA-256 fingerprint of
-  stable fields for Humane Society listings without an exposed ID) and
-  Firestore's `animals.alert_sent` field. If a listing's detail URL or
-  description changes in a way that looks "new" you may want to strengthen
-  the fingerprint fields used by `build_fingerprint_key()` calls in
-  `scrapers/base.py`.
-- **One source is always failing**: check `source_runs` in Firestore for
-  its latest `error_message` -- the app is designed so a single failing
-  source never stops the other three.
+MIT -- see [`LICENSE`](LICENSE). Forks and derivative projects,
+including commercial ones, are explicitly permitted. The maintainer(s)
+are not committing to operate any hosted service, nationwide or
+otherwise, on your behalf.

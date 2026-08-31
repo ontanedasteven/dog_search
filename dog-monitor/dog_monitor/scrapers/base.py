@@ -15,7 +15,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from typing import List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import Browser, Page
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -56,14 +56,25 @@ MAX_LOAD_MORE_CLICKS = 15
 class HumaneSocietyCardScraper(BaseScraper):
     """Generic engine for WordPress/CMS-style "pet card" listing pages.
 
-    Subclasses set `url`, `base_url`, and `card_selectors`; this class
-    handles page load, lazy-load scrolling, "Load More" buttons, card
-    discovery, and field extraction.
+    `url` and `region` come from this source's `SourceConfig` (see
+    `dog_monitor.sources`) via the constructor -- they live in one place
+    (the registry), not duplicated as class attributes here. Subclasses
+    set only `card_selectors` (genuine site-specific markup knowledge that
+    can't be centralized) and their own fixed `source_name` (the stable
+    Firestore/dedup identifier -- see sources.py's module docstring for
+    why that's intentionally separate from the registry's `SourceConfig.id`).
+    This class handles page load, lazy-load scrolling, "Load More"
+    buttons, card discovery, and field extraction.
     """
 
-    url: str = ""
-    base_url: str = ""
     card_selectors: List[str] = []
+
+    def __init__(self, url: str, region: str, headless: bool = True, timeout_ms: int = 30000):
+        super().__init__(headless=headless, timeout_ms=timeout_ms)
+        self.url = url
+        self.region = region
+        parsed = urlsplit(url)
+        self.base_url = f"{parsed.scheme}://{parsed.netloc}"
 
     def scrape(self, browser: Browser) -> List[Animal]:
         page = browser.new_page()
