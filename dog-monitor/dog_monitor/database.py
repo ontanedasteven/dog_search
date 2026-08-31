@@ -2,17 +2,22 @@
 bookkeeping.
 
 The application is stateless between Cloud Run Job executions except for
-what is stored in Firestore. Three collections are used:
+what is stored in Firestore. Four collections are used:
 
-- animals:      one document per animal_key (dedup identity), fields match
-                 the original project schema (animal_id, name, breed_text,
-                 description, match_level, matched_term, weight, first_seen,
-                 last_seen, alert_sent, active).
+- animals:      one document per animal_key (dedup identity): animal_key,
+                 animal_id, name, source, region, breed, description,
+                 match_level, matched_term, weight, listing_url, first_seen,
+                 last_seen, alert_sent, active.
 - sightings:    one document per (animal_key, source) pair, doc id
                  f"{animal_key}__{source}", tracking per-source first/last
                  seen + the current listing URL/region.
 - source_runs:  one auto-ID document per scraper run, recording success,
                  counts, and any error message.
+- monitor_state: a single document (id "monitor") holding
+                 last_successful_full_scan (ISO 8601 UTC), used to enforce
+                 the 96-hour minimum interval between full shelter scans
+                 (see main.is_scan_due) even though Cloud Scheduler may
+                 invoke the job daily.
 
 Firestore is schemaless, so there is no separate migration step: collections
 and fields are created implicitly on first write. FirestoreStore itself
@@ -38,6 +43,8 @@ logger = logging.getLogger(__name__)
 ANIMALS_COLLECTION = "animals"
 SIGHTINGS_COLLECTION = "sightings"
 SOURCE_RUNS_COLLECTION = "source_runs"
+MONITOR_STATE_COLLECTION = "monitor_state"
+MONITOR_STATE_DOC_ID = "monitor"
 
 
 def _utcnow() -> str:
@@ -107,13 +114,17 @@ class FirestoreStore:
         if not snap.exists:
             doc_ref.set(
                 {
+                    "animal_key": animal.animal_key,
                     "animal_id": animal.animal_id,
                     "name": animal.name,
-                    "breed_text": animal.breed_text,
+                    "source": animal.source,
+                    "region": animal.region,
+                    "breed": animal.breed_text,
                     "description": animal.description,
                     "match_level": _level_value(animal.match_level),
                     "matched_term": animal.matched_term,
                     "weight": animal.weight,
+                    "listing_url": animal.url,
                     "first_seen": now,
                     "last_seen": now,
                     "alert_sent": False,
@@ -125,8 +136,9 @@ class FirestoreStore:
             doc_ref.update(
                 {
                     "description": animal.description,
-                    "breed_text": animal.breed_text,
+                    "breed": animal.breed_text,
                     "weight": animal.weight,
+                    "listing_url": animal.url,
                     "last_seen": now,
                     "active": True,
                 }
@@ -193,4 +205,28 @@ class FirestoreStore:
                 "matches_found": matches_found,
                 "error_message": error_message,
             }
+        )
+
+    def _monitor_state_ref(self):
+        return self.client.collection(MONITOR_STATE_COLLECTION).document(MONITOR_STATE_DOC_ID)
+
+    def get_last_successful_full_scan(self) -> Optional[datetime]:
+        """Return the UTC timestamp of the last full scan that completed
+        end-to-end (all sources attempted, matches processed), or None if a
+        full scan has never completed successfully."""
+        snap = self._monitor_state_ref().get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        raw = data.get("last_successful_full_scan")
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw)
+
+    def update_last_successful_full_scan(self, when: Optional[datetime] = None) -> None:
+        """Record that a full scan just completed successfully. Called once,
+        after all sources have been attempted and alerts processed."""
+        when = when or datetime.now(timezone.utc)
+        self._monitor_state_ref().set(
+            {"last_successful_full_scan": when.isoformat()}, merge=True
         )

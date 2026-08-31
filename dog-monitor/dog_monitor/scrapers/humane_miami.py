@@ -9,9 +9,12 @@ class HumaneMiamiScraper(HumaneSocietyCardScraper):
     url = "https://www.humanesocietymiami.org/adopt-a-pet-today/"
     base_url = "https://www.humanesocietymiami.org"
 
-    # See base.py's module docstring: verify these against the live DOM on
-    # first deployment and update if the site logs a selector warning.
+    # Verified live on 2026-08-31: cards are `<li class="adoptable-pet-card
+    # visible">` (server-rendered, no JS wait needed). Kept as the first
+    # candidate; the rest remain as fallbacks in case the site's markup
+    # changes again.
     card_selectors = [
+        ".adoptable-pet-card",
         ".pet-item",
         ".pet-card",
         "[class*='animal-card']",

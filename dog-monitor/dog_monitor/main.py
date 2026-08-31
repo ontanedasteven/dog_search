@@ -7,14 +7,25 @@ is stateless between executions -- all dedup/alert state lives in Firestore,
 which is exactly what Cloud Run Jobs expects (each execution is a fresh
 container).
 
+Cloud Scheduler may invoke this job as often as once per day, but a full
+shelter scan should only actually happen once every 96 hours (four days).
+That interval is enforced here, not in the scheduler: `is_scan_due()` reads
+`monitor_state.last_successful_full_scan` from Firestore before touching
+Playwright or any scraper, and exits successfully (without scraping) if
+fewer than 96 hours have elapsed. This is a true rolling interval, not a
+calendar-based cron approximation (e.g. `*/4` in the day-of-month field
+resets at each month boundary and is not equivalent to "every 96 hours").
+
 Exit codes:
-  0 - the run completed, even if one or more individual sources failed.
+  0 - the run completed (scan performed, or skipped because it wasn't due
+      yet), even if one or more individual sources failed.
   1 - a fatal application-level error (invalid configuration, or the
       Firestore client could not be initialized).
 """
 
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from playwright.sync_api import sync_playwright
@@ -30,6 +41,11 @@ from .scrapers.humane_miami import HumaneMiamiScraper
 from .scrapers.petconnect import PetConnectScraper
 
 logger = logging.getLogger(__name__)
+
+# Minimum time between full shelter scans. Cloud Scheduler may trigger this
+# job daily; is_scan_due() gates the actual scraping on this true rolling
+# window rather than relying on the scheduler's cadence.
+FULL_SCAN_INTERVAL_HOURS = 96
 
 
 def build_scrapers(headless: bool) -> List[BaseScraper]:
@@ -122,6 +138,16 @@ def send_pending_alerts(db: FirestoreStore, config: Config, alertable: List[Anim
         )
 
 
+def is_scan_due(db: FirestoreStore, interval_hours: float = FULL_SCAN_INTERVAL_HOURS) -> bool:
+    """True if a full scan has never completed, or the last one completed
+    at least `interval_hours` ago."""
+    last = db.get_last_successful_full_scan()
+    if last is None:
+        return True
+    elapsed = datetime.now(timezone.utc) - last
+    return elapsed >= timedelta(hours=interval_hours)
+
+
 def main() -> int:
     try:
         config = load_config()
@@ -138,8 +164,17 @@ def main() -> int:
         logger.exception("Fatal error initializing Firestore client")
         return 1
 
-    all_alertable: List[Animal] = []
     try:
+        if not is_scan_due(db):
+            last = db.get_last_successful_full_scan()
+            logger.info(
+                "Full scan not due yet (last_successful_full_scan=%s, "
+                "interval=%dh); skipping scrape for this invocation.",
+                last.isoformat() if last else None, FULL_SCAN_INTERVAL_HOURS,
+            )
+            return 0
+
+        all_alertable: List[Animal] = []
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=config.headless)
             try:
@@ -150,6 +185,8 @@ def main() -> int:
                 browser.close()
 
         send_pending_alerts(db, config, all_alertable)
+        db.update_last_successful_full_scan()
+        logger.info("Recorded last_successful_full_scan for this run.")
     finally:
         db.close()
 

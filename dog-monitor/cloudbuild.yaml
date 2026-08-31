@@ -1,5 +1,6 @@
-# Builds the container image and pushes it to Artifact Registry, then
-# updates the existing Cloud Run Job to use the new image.
+# Runs the unit test suite, and only on success builds the container image,
+# pushes it to Artifact Registry, and updates the existing Cloud Run Job to
+# use the new image.
 #
 # Usage:
 #   gcloud builds submit --config cloudbuild.yaml \
@@ -12,6 +13,9 @@
 #
 # The build service account needs roles/run.developer (to update the job)
 # in addition to the default Cloud Build permissions for Artifact Registry.
+# Cloud Build steps run sequentially by default (each waits for the prior
+# step), so the "test" step below blocks "build"/push/deploy on failure
+# without any explicit waitFor.
 
 substitutions:
   _REGION: us-east1
@@ -20,6 +24,16 @@ substitutions:
   _JOB_NAME: dog-monitor-job
 
 steps:
+  - name: 'python:3.12-slim'
+    id: test
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        set -e
+        pip install --no-cache-dir -r requirements.txt
+        python -m pytest -v
+
   - name: 'gcr.io/cloud-builders/docker'
     id: build
     args:

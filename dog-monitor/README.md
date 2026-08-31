@@ -12,12 +12,17 @@ stateless between executions).
 - **Compute**: a single-container Cloud Run Job (`python -m dog_monitor.main`)
   that runs to completion once per execution and exits. No server, no long-
   running process.
-- **State**: Firestore (three collections: `animals`, `sightings`,
-  `source_runs`). This is the *only* thing that persists between runs --
-  the container's local filesystem is discarded after each execution.
-- **Scheduling**: Cloud Scheduler triggers a Cloud Run Job execution via the
-  Cloud Run Jobs REST API (`...:run`) on a cron schedule approximating every
-  4 days (see the caveat in "Changing the schedule" below).
+- **State**: Firestore (four collections: `animals`, `sightings`,
+  `source_runs`, `monitor_state`). This is the *only* thing that persists
+  between runs -- the container's local filesystem is discarded after each
+  execution.
+- **Scheduling**: Cloud Scheduler triggers a Cloud Run Job execution **once
+  per day**. The application itself enforces the true "once every 4 days"
+  requirement: on each invocation it reads `monitor_state.last_successful_full_scan`
+  from Firestore, and if fewer than 96 hours have elapsed it logs that the
+  scan isn't due and exits successfully without scraping anything. This is a
+  real rolling 96-hour window, not a calendar-based cron approximation (see
+  `main.is_scan_due` / `FULL_SCAN_INTERVAL_HOURS`).
 - **Scraping**: Playwright + Chromium (headless), one scraper module per
   source, sharing a small generic engine for the two Humane Society sites.
 - **Alerts**: Gmail SMTP via `smtplib`, using an App Password from Secret
@@ -194,10 +199,12 @@ it, which isn't wired up here.
 
 ### Building with Cloud Build directly
 
-`cloudbuild.yaml` builds the image, pushes it to Artifact Registry, and
-updates the (already-created) Cloud Run Job to use it -- useful once you've
-done the one-time `gcloud run jobs create` below and want repeatable
-redeploys (manually or via a Cloud Build trigger on push):
+`cloudbuild.yaml` runs the unit test suite (aborting the whole build if any
+test fails), then builds the image, pushes it to Artifact Registry tagged
+with both `$SHORT_SHA` and `latest`, and updates the (already-created)
+Cloud Run Job to use the `$SHORT_SHA`-tagged image -- useful once you've
+done the one-time `gcloud run jobs create` below and want repeatable,
+test-gated redeploys (manually or via a Cloud Build trigger on push):
 
 ```bash
 gcloud builds submit --config cloudbuild.yaml \
@@ -275,9 +282,9 @@ gcloud run jobs create dog-monitor-job \
   --service-account dog-monitor-runner@PROJECT_ID.iam.gserviceaccount.com \
   --tasks 1 \
   --max-retries 1 \
-  --task-timeout 900s \
-  --memory 2Gi \
-  --cpu 2 \
+  --task-timeout 1800s \
+  --memory 1Gi \
+  --cpu 1 \
   --set-env-vars LOG_LEVEL=INFO,HEADLESS=true \
   --set-secrets EMAIL_FROM=dog-monitor-email-from:latest,EMAIL_TO=dog-monitor-email-to:latest,EMAIL_PASSWORD=dog-monitor-email-password:latest
 ```
@@ -285,9 +292,21 @@ gcloud run jobs create dog-monitor-job \
 `GOOGLE_CLOUD_PROJECT` is injected automatically by Cloud Run, so
 `FIRESTORE_PROJECT_ID` does not need to be set explicitly here.
 
-Headless Chromium is memory-hungry with four sources' worth of pages open
-over a run; `--memory 2Gi --cpu 2` is a reasonable starting point -- lower it
-once you've watched actual usage in Cloud Monitoring.
+`--memory 1Gi --cpu 1` are conservative starting points and held up fine in
+live testing. The task timeout started at 900s (15 min) per the original
+spec but was raised to 1800s (30 min) after a live run against the real
+24Petconnect MIAD agency (745 listed animals -- Miami-Dade is a large
+county shelter) showed that visiting detail pages for every animal whose
+breed text contains "Terrier" as a substring (Pit Bull Terrier, American
+Staffordshire Terrier, Boston Terrier, etc. -- intentional, since any of
+these *could* individually be a legitimately small dog; see
+`matching.classify_breed`) for weight confirmation took longer than 900s
+combined with the other three sources. This is a background job on a
+4-day cadence, not latency-sensitive, so a longer ceiling is the right
+fix rather than reducing scan coverage. Watch actual usage in Cloud
+Monitoring after a few real executions and raise `--memory`/`--cpu`
+further only if needed (e.g. `gcloud run jobs update dog-monitor-job
+--memory 2Gi --cpu 2 --region REGION`).
 
 ### 6. Run it once manually to verify
 
@@ -308,9 +327,16 @@ or in the Cloud Console: Cloud Run -> Jobs -> dog-monitor-job -> Executions
 
 ### 8. Schedule it with Cloud Scheduler
 
-Cloud Scheduler triggers jobs via unix-cron, which is **calendar-based, not
-a rolling interval** -- see the caveat below. Create an invoker service
-account and the schedule:
+Cloud Scheduler invokes the job **once per day** at 08:00 America/New_York;
+the application itself enforces the true 96-hour minimum interval between
+full scans (see "Architecture" above) by checking
+`monitor_state.last_successful_full_scan` in Firestore before scraping, so
+most daily invocations simply log "not due yet" and exit 0 immediately.
+This is deliberately *not* a `*/4` day-of-month cron expression -- unix-cron
+is calendar-based (it resets at month boundaries) and cannot express a true
+rolling 4-day interval, so the app enforces it in code instead.
+
+Create an invoker service account and the schedule:
 
 ```bash
 gcloud iam service-accounts create dog-monitor-scheduler \
@@ -323,7 +349,8 @@ gcloud run jobs add-iam-policy-binding dog-monitor-job \
 
 gcloud scheduler jobs create http dog-monitor-schedule \
   --location REGION \
-  --schedule "0 8 */4 * *" \
+  --schedule "0 8 * * *" \
+  --time-zone "America/New_York" \
   --uri "https://REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/PROJECT_ID/jobs/dog-monitor-job:run" \
   --http-method POST \
   --oauth-service-account-email dog-monitor-scheduler@PROJECT_ID.iam.gserviceaccount.com
@@ -335,19 +362,6 @@ Verify and test-fire it:
 gcloud scheduler jobs describe dog-monitor-schedule --location REGION
 gcloud scheduler jobs run dog-monitor-schedule --location REGION
 ```
-
-**Cron caveat on "every 4 days":** unlike systemd's `OnUnitActiveSec=4d`
-(a true rolling interval), unix-cron's `*/4` in the day-of-month field fires
-on days 4, 8, 12, 16, 20, 24, 28 of *every calendar month* -- the gap resets
-at each month boundary (e.g. the 28th to the 4th is only 7 days, or the 1st
-of a new month if the 28th doesn't divide evenly). Cloud Scheduler has no
-native "every N days" option. This is the standard, widely-used
-approximation and is good enough for a "check every few days" adoption
-monitor; if you need a truly exact rolling 4-day cadence, you'd need to add
-a small amount of extra infrastructure (e.g. a Cloud Scheduler job that
-fires daily into a lightweight Cloud Function/Cloud Run service that reads
-"last run" from Firestore and only triggers the job when 4+ days have
-elapsed) -- out of scope for this project's Cloud Scheduler-only setup.
 
 ## Changing the breed rules
 
