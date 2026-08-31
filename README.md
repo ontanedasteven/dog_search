@@ -123,7 +123,7 @@ concern, not an application rewrite.
 ## Project Structure
 
 ```
-dog-monitor/
+dog_search/
 ├── dog_monitor/
 │   ├── sources.py            # the source registry -- start here to add/edit a shelter
 │   ├── config.py             # env-var configuration
